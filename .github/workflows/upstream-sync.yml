@@ -1,0 +1,154 @@
+name: Safe upstream sync
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - sync/develop
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync-crm
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      UPSTREAM_REPO: frappe/crm
+      UPSTREAM_BRANCH: develop
+      PRODUCT_BRANCH: custom/develop-fa
+      VENDOR_BRANCH: vendor/develop
+      SYNC_BRANCH: sync/develop
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - name: Safely update mirror and prepare proposal
+        id: prepare
+        shell: bash
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          upstream_ref="refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          upstream_sha="$(git rev-parse "$upstream_ref")"
+          if git ls-remote --exit-code --heads origin "$VENDOR_BRANCH" >/dev/null 2>&1; then
+            git fetch --no-tags origin "+refs/heads/${VENDOR_BRANCH}:refs/remotes/origin/${VENDOR_BRANCH}"
+            vendor_ref="refs/remotes/origin/${VENDOR_BRANCH}"
+            if ! git merge-base --is-ancestor "$vendor_ref" "$upstream_ref"; then
+              echo "vendor branch is ahead of or diverged from upstream; refusing to rewrite it" >&2
+              exit 1
+            fi
+            vendor_sha="$(git rev-parse "$vendor_ref")"
+            if [[ "$vendor_sha" != "$upstream_sha" ]]; then
+              git push origin "${upstream_ref}:refs/heads/${VENDOR_BRANCH}"
+            fi
+          else
+            git push origin "${upstream_ref}:refs/heads/${VENDOR_BRANCH}"
+          fi
+          git fetch --no-tags origin "+refs/heads/${PRODUCT_BRANCH}:refs/remotes/origin/product"
+          product_ref="refs/remotes/origin/product"
+          product_sha="$(git rev-parse "$product_ref")"
+          if git ls-remote --exit-code --heads origin "$SYNC_BRANCH" >/dev/null 2>&1; then
+            git fetch --no-tags origin "+refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}"
+            git switch --detach "refs/remotes/origin/${SYNC_BRANCH}"
+          else
+            git switch --detach "$product_ref"
+          fi
+          git switch -c sync-candidate
+          initial_candidate_sha="$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor "$product_ref" HEAD; then
+            git merge --no-edit "$product_ref"
+          fi
+          if ! git merge-base --is-ancestor "$upstream_ref" HEAD; then
+            git merge --no-edit "$upstream_ref"
+          fi
+          candidate_sha="$(git rev-parse HEAD)"
+          if [[ "$candidate_sha" == "$initial_candidate_sha" ]] || git diff --quiet "${product_ref}...HEAD"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No candidate change; skipped tests, push, and PR operations."
+            exit 0
+          fi
+          {
+            echo "changed=true"
+            echo "product_ref=${product_ref}"
+            echo "product_sha=${product_sha}"
+            echo "upstream_sha=${upstream_sha}"
+            echo "candidate_sha=${candidate_sha}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Set up Python for changed source files
+        if: steps.prepare.outputs.changed == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Validate exact candidate SHA
+        if: steps.prepare.outputs.changed == 'true'
+        shell: bash
+        run: bash .github/scripts/validate-candidate.sh "${{ steps.prepare.outputs.product_ref }}" "${{ steps.prepare.outputs.candidate_sha }}"
+      - name: Push candidate and create or update Draft PR
+        if: steps.prepare.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ steps.prepare.outputs.candidate_sha }}"
+          git push origin "${{ steps.prepare.outputs.candidate_sha }}:refs/heads/${{ env.SYNC_BRANCH }}"
+          changed_files="$(git diff --name-only "${{ steps.prepare.outputs.product_ref }}...${{ steps.prepare.outputs.candidate_sha }}")"
+          pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --base "$PRODUCT_BRANCH" --head "$SYNC_BRANCH" --json number --jq '.[0].number // empty')"
+          summary_file="$(mktemp)"
+          cat > "$summary_file" <<EOF
+          Upstream: \`${{ env.UPSTREAM_REPO }}:${{ env.UPSTREAM_BRANCH }}\` at \`${{ steps.prepare.outputs.upstream_sha }}\`
+          Product base: \`${{ steps.prepare.outputs.product_sha }}\`
+          Candidate SHA: \`${{ steps.prepare.outputs.candidate_sha }}\`
+          Validation: changed Python/shell syntax and whitespace; actionlint runs when workflow files changed.
+          Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Changed files:
+          $(printf '%s\n' "$changed_files" | sed 's/^/- /')
+
+          This is a proposal only. No product branch is merged or deployed automatically. Full project builds/tests are not run by this lightweight Git-infrastructure workflow.
+          EOF
+          if [[ -z "$pr_number" ]]; then
+            gh pr create --repo "$GITHUB_REPOSITORY" --draft --base "$PRODUCT_BRANCH" --head "$SYNC_BRANCH" --title "chore(sync): propose ${{ env.UPSTREAM_BRANCH }} upstream update" --body-file "$summary_file"
+          else
+            gh pr comment --repo "$GITHUB_REPOSITORY" "$pr_number" --body-file "$summary_file"
+          fi
+          rm -f "$summary_file"
+          echo "Validated candidate ${{ steps.prepare.outputs.candidate_sha }} from upstream ${{ steps.prepare.outputs.upstream_sha }}." >> "$GITHUB_STEP_SUMMARY"
+  validate-manual-sync-branch:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      PRODUCT_BRANCH: custom/develop-fa
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Validate manually updated candidate SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/heads/${{ env.PRODUCT_BRANCH }}:refs/remotes/origin/product"
+          bash .github/scripts/validate-candidate.sh refs/remotes/origin/product "${{ github.sha }}"

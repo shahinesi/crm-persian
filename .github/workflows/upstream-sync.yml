@@ -83,9 +83,10 @@ jobs:
             git merge --no-edit "$upstream_ref"
           fi
           candidate_sha="$(git rev-parse HEAD)"
-          if [[ "$candidate_sha" == "$initial_candidate_sha" ]] || git diff --quiet "${product_ref}...HEAD"; then
+          existing_pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --base "$PRODUCT_BRANCH" --head "$SYNC_BRANCH" --json number --jq '.[0].number // empty')"
+          if git diff --quiet "${product_ref}...HEAD" || { [[ "$candidate_sha" == "$initial_candidate_sha" ]] && [[ -n "$existing_pr" ]]; }; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No candidate change; skipped tests, push, and PR operations."
+            echo "No new candidate change; skipped tests, push, and PR operations."
             exit 0
           fi
           {

@@ -36,6 +36,9 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
+      - name: Preserve candidate validator
+        shell: bash
+        run: cp .github/scripts/validate-candidate.sh "$RUNNER_TEMP/validate-candidate.sh"
       - name: Safely update mirror and prepare proposal
         id: prepare
         shell: bash
@@ -80,9 +83,10 @@ jobs:
             git merge --no-edit "$upstream_ref"
           fi
           candidate_sha="$(git rev-parse HEAD)"
-          if [[ "$candidate_sha" == "$initial_candidate_sha" ]] || git diff --quiet "${product_ref}...HEAD"; then
+          existing_pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --base "$PRODUCT_BRANCH" --head "$SYNC_BRANCH" --json number --jq '.[0].number // empty')"
+          if git diff --quiet "${product_ref}...HEAD" || { [[ "$candidate_sha" == "$initial_candidate_sha" ]] && [[ -n "$existing_pr" ]]; }; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No candidate change; skipped tests, push, and PR operations."
+            echo "No new candidate change; skipped tests, push, and PR operations."
             exit 0
           fi
           {
@@ -100,7 +104,7 @@ jobs:
       - name: Validate exact candidate SHA
         if: steps.prepare.outputs.changed == 'true'
         shell: bash
-        run: bash .github/scripts/validate-candidate.sh "${{ steps.prepare.outputs.product_ref }}" "${{ steps.prepare.outputs.candidate_sha }}"
+        run: bash "$RUNNER_TEMP/validate-candidate.sh" "${{ steps.prepare.outputs.product_ref }}" "${{ steps.prepare.outputs.candidate_sha }}"
       - name: Push candidate and create or update Draft PR
         if: steps.prepare.outputs.changed == 'true'
         shell: bash
@@ -143,6 +147,14 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+      - name: Fetch validator from default branch
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/default"
+          git show refs/remotes/origin/default:.github/scripts/validate-candidate.sh > "$RUNNER_TEMP/validate-candidate.sh"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
@@ -151,4 +163,4 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin "refs/heads/${{ env.PRODUCT_BRANCH }}:refs/remotes/origin/product"
-          bash .github/scripts/validate-candidate.sh refs/remotes/origin/product "${{ github.sha }}"
+          bash "$RUNNER_TEMP/validate-candidate.sh" refs/remotes/origin/product "${{ github.sha }}"

@@ -2,7 +2,20 @@
 set -euo pipefail
 base_ref="$1"
 head_ref="$2"
-git diff --check "${base_ref}...${head_ref}"
+git diff --check "${base_ref}...${head_ref}" -- . ':(exclude)crm/locale/*.po'
+po_diff_check_output="$(git diff --check "${base_ref}...${head_ref}" -- 'crm/locale/*.po' 2>&1 || true)"
+if [[ -n "$po_diff_check_output" ]]; then
+  unexpected_po_diff_check="$(printf '%s\n' "$po_diff_check_output" | awk '
+    /^crm\/locale\/[^:]+\.po:[0-9]+: new blank line at EOF\.$/ { next }
+    { print; found = 1 }
+    END { if (!found) exit 0 }
+  ')"
+  if [[ -n "$unexpected_po_diff_check" ]]; then
+    printf '%s\n' "$unexpected_po_diff_check" >&2
+    exit 1
+  fi
+  echo "Ignoring only known upstream PO-catalog blank lines at EOF; other PO whitespace errors remain fatal."
+fi
 python3 - "$base_ref" "$head_ref" <<'PYTEST'
 import pathlib
 import subprocess
